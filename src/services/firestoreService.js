@@ -4,8 +4,8 @@ import {
   doc,
   getDoc,
   getDocs,
+  serverTimestamp,
   setDoc,
-  Timestamp,
   updateDoc,
 } from 'firebase/firestore'
 import { format, isValid, parse } from 'date-fns'
@@ -146,7 +146,7 @@ const toFirestoreData = (collectionName, input, isCreate = false) => {
   if (collectionName === COLLECTIONS.usuarios) {
     if (data.salonesIds !== undefined) data.salonesIds = asArray(data.salonesIds)
     if (data.rol && data.rol !== 'dueno') delete data.salonesIds
-    if (isCreate || typeof data.fechaCreacion === 'string') data.fechaCreacion = Timestamp.now()
+    if (isCreate || typeof data.fechaCreacion === 'string') data.fechaCreacion = serverTimestamp()
   }
 
   if (collectionName === COLLECTIONS.salones) {
@@ -173,7 +173,7 @@ const toFirestoreData = (collectionName, input, isCreate = false) => {
     data.salonesIds = asArray(data.salonesIds)
     data.serviciosIds = asArray(data.serviciosIds)
     data.duenoId = Array.isArray(data.duenoId) ? data.duenoId[0] ?? '' : data.duenoId ?? ''
-    if (isCreate || typeof data.fechaCreacion === 'string') data.fechaCreacion = Timestamp.now()
+    if (isCreate || typeof data.fechaCreacion === 'string') data.fechaCreacion = serverTimestamp()
     for (const key of ['identificadorChat', 'identificadorPagoStripe', 'identificadorSalaVideo']) {
       if (data[key] === '') data[key] = null
     }
@@ -181,7 +181,7 @@ const toFirestoreData = (collectionName, input, isCreate = false) => {
 
   if (collectionName === COLLECTIONS.pagos) {
     data.salonesIds = asArray(data.salonesIds)
-    if (isCreate || typeof data.fechaCreacion === 'string') data.fechaCreacion = Timestamp.now()
+    if (isCreate || typeof data.fechaCreacion === 'string') data.fechaCreacion = serverTimestamp()
     if (data.fechaPago === '') data.fechaPago = null
     if (data.identificadorPagoStripe === '') data.identificadorPagoStripe = null
   }
@@ -194,12 +194,15 @@ const createDocument = async (collectionName, input) => {
 
   const data = toFirestoreData(collectionName, input, true)
   if (input.id) {
-    await setDoc(doc(db, collectionName, input.id), data)
-    return normalizeRecord(collectionName, input.id, data)
+    const reference = doc(db, collectionName, input.id)
+    await setDoc(reference, data)
+    const created = await getDoc(reference)
+    return normalizeRecord(collectionName, created.id, created.data())
   }
 
   const reference = await addDoc(collection(db, collectionName), data)
-  return normalizeRecord(collectionName, reference.id, data)
+  const created = await getDoc(reference)
+  return normalizeRecord(collectionName, created.id, created.data())
 }
 
 const updateDocument = async (collectionName, id, updates) => {

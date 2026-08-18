@@ -12,7 +12,8 @@ export function StreamChatWidget({ reservation, currentUser, counterpartName, co
   const [error, setError] = useState(null)
   const messagesEndRef = useRef(null)
 
-  const channelId = reservation.identificadorChat || `chat_res_${reservation.id}`
+  const storedChannelId = reservation.identificadorChat
+  const channelId = storedChannelId && storedChannelId !== 'pendiente' ? storedChannelId : `chat_res_${reservation.id}`
   const ownerId = Array.isArray(reservation.duenoId) ? reservation.duenoId[0] : (reservation.duenoId || '')
   const clientId = reservation.clienteId
 
@@ -103,7 +104,7 @@ export function StreamChatWidget({ reservation, currentUser, counterpartName, co
         chatClient.disconnectUser().catch((err) => console.error('Error desconectando Stream user:', err))
       }
     }
-  }, [reservation.id, currentUser?.id])
+  }, [reservation.id, channelId, currentUser?.id])
 
   const handleSendMessage = async (e) => {
     e.preventDefault()

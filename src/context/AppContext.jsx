@@ -25,7 +25,7 @@ import {
   signOutFromFirebase,
   subscribeToAuthState,
 } from '../services/authService'
-import { createStripeCheckout, syncStripeCheckout } from '../services/stripeService'
+import { createStripeCheckout, getStripeBackendUrl, syncStripeCheckout } from '../services/stripeService'
 
 /* The provider and its hook are intentionally colocated for the app shell. */
 /* eslint-disable react-refresh/only-export-components */
@@ -40,6 +40,9 @@ const mockPasswords = {
 }
 
 const getInitialDate = () => format(addDays(new Date(), 7), 'yyyy-MM-dd')
+const PENDING_IDENTIFIER = 'pendiente'
+const STRIPE_PENDING_MESSAGE = 'Reservación creada. Pago pendiente de conexión con Stripe.'
+const TERMS_VERSION = '2026-08-18'
 
 const syncSalonAvailability = (nextData) => ({
   ...nextData,
@@ -374,84 +377,105 @@ export function AppProvider({ children }) {
 
   const createReservation = async () => {
     const salon = data.salones.find((item) => item.id === bookingDraft.salonId)
-    if (!currentUser) return { ok: false, message: 'Inicia sesión como cliente para crear la reservación.' }
+    if (!currentUser?.id || currentUser.rol !== 'cliente') return { ok: false, message: 'Inicia sesión como cliente para crear la reservación.' }
     if (!salon) return { ok: false, message: 'Selecciona un salón válido.' }
 
-    const salonAvailability = data.disponibilidad.filter((item) => item.salonesIds?.includes(salon.id))
     const selectedAvailability = findAvailabilityForSalonDate(data.disponibilidad, salon.id, bookingDraft.date)
-    if (selectedAvailability && selectedAvailability.estado !== 'disponible') {
-      return { ok: false, message: `La fecha seleccionada está ${selectedAvailability.estado}. Elige otra fecha.` }
-    }
-    if (salonAvailability.length && !selectedAvailability) {
+    if (!selectedAvailability) {
       return { ok: false, message: 'Selecciona una fecha disponible para este salón.' }
+    }
+    if (selectedAvailability.estado !== 'disponible') {
+      return { ok: false, message: `La fecha seleccionada está ${selectedAvailability.estado}. Elige otra fecha.` }
     }
 
     const services = data.servicios.filter((service) => bookingDraft.servicesIds.includes(service.id))
-    const totalServices = services.reduce((total, service) => total + service.precio, 0)
+    const serviceIds = services.map((service) => service.id)
+    const totalServices = services.reduce((total, service) => total + Number(service.precio || 0), 0)
     const owner = findSalonOwner(data.usuarios, salon)
-    const priceSalon = selectedAvailability?.precio ?? salon.basePrice ?? 0
+    const priceSalon = Number(selectedAvailability.precio ?? salon.basePrice ?? 0) || 0
     const salonIds = [salon.id]
+    const total = priceSalon + totalServices
+    const fechaCreacion = format(new Date(), 'yyyy-MM-dd')
 
-    if (firebaseConfigured) {
-      try {
-        const checkout = await createStripeCheckout({
-          salonId: salon.id,
-          date: bookingDraft.date,
-          serviceIds: bookingDraft.servicesIds,
-          termsAccepted: true,
-          termsVersion: '2026-08-18',
-        })
-        return {
-          ok: true,
-          checkoutUrl: checkout.url,
-          reservation: { id: checkout.reservationId },
-        }
-      } catch (error) {
-        return { ok: false, message: error.message }
-      }
-    }
-
+    console.log('[reservaciones] creando reservacion')
     const reservation = await crearReservacion({
       clienteId: currentUser.id,
       duenoId: owner?.id ?? salon.duenoId ?? '',
       estadoPago: 'pendiente',
       estadoReservacion: 'pendiente',
       fecha: bookingDraft.date,
-      fechaCreacion: format(new Date(), 'yyyy-MM-dd'),
-      identificadorChat: null,
-      identificadorPagoStripe: null,
-      identificadorSalaVideo: null,
+      fechaCreacion,
+      identificadorChat: PENDING_IDENTIFIER,
+      identificadorPagoStripe: PENDING_IDENTIFIER,
+      identificadorSalaVideo: PENDING_IDENTIFIER,
       precioSalon: priceSalon,
       salonesIds: salonIds,
-      serviciosIds: bookingDraft.servicesIds,
-      total: priceSalon + totalServices,
+      serviciosIds: serviceIds,
+      terminosAceptados: { version: TERMS_VERSION, fecha: fechaCreacion },
+      total,
       totalServicios: totalServices,
     })
+    console.log('[reservaciones] reservacion creada', reservation.id)
+
+    console.log('[reservaciones] creando pago')
     const payment = await crearPago({
       clienteId: currentUser.id,
       estadoPago: 'pendiente',
-      fechaCreacion: format(new Date(), 'yyyy-MM-dd'),
+      fechaCreacion,
       fechaPago: null,
-      identificadorPagoStripe: null,
+      identificadorPagoStripe: PENDING_IDENTIFIER,
       metodoPago: 'stripe',
-      monto: reservation.total,
+      monto: total,
       reservacionId: reservation.id,
       salonesIds: salonIds,
-      tipoPago: 'total',
+      tipoPago: 'apartado',
     })
-    let disponibilidad = data.disponibilidad
-    if (selectedAvailability) {
-      const updatedAvailability = await actualizarDisponibilidad(selectedAvailability.id, { estado: 'reservada' })
-      disponibilidad = data.disponibilidad.map((item) => item.id === selectedAvailability.id ? updatedAvailability : item)
-    }
+    console.log('[reservaciones] pago creado', payment.id)
+
+    console.log('[reservaciones] actualizando disponibilidad')
+    const updatedAvailability = await actualizarDisponibilidad(selectedAvailability.id, {
+      estado: 'reservada',
+      reservacionId: reservation.id,
+    })
+    console.log('[reservaciones] disponibilidad actualizada', updatedAvailability.id)
+
+    const disponibilidad = data.disponibilidad.map((item) => item.id === selectedAvailability.id ? updatedAvailability : item)
     refreshData({ ...data, disponibilidad, reservaciones: [...data.reservaciones, reservation], pagos: [...data.pagos, payment] })
-    notify('Reservación demo creada. Configura Firebase y Stripe para cobrarla.', 'info')
-    return { ok: true, reservation }
+
+    if (!firebaseConfigured) {
+      notify(STRIPE_PENDING_MESSAGE, 'warning')
+      return { ok: true, reservation, payment, message: STRIPE_PENDING_MESSAGE }
+    }
+
+    console.log('[reservaciones] iniciando stripe')
+    try {
+      const checkout = await createStripeCheckout({ reservationId: reservation.id })
+      if (!checkout.url) throw new Error('Stripe no devolvió una URL de pago válida.')
+      return {
+        ok: true,
+        checkoutUrl: checkout.url,
+        reservation,
+        payment,
+      }
+    } catch (error) {
+      console.warn('[reservaciones] stripe fallo', error)
+      notify(STRIPE_PENDING_MESSAGE, 'warning')
+      return {
+        ok: true,
+        reservation,
+        payment,
+        message: STRIPE_PENDING_MESSAGE,
+        stripeError: error.message,
+      }
+    }
   }
 
   const startStripePayment = async (reservationId) => {
+    console.log('Iniciando pago Stripe', { reservationId })
+    console.log('URL backend Stripe:', `${getStripeBackendUrl()}/stripe/checkout-session`)
     try {
       const checkout = await createStripeCheckout({ reservationId })
+      console.log('Respuesta backend Stripe:', checkout)
       if (checkout.status === 'paid') {
         if (checkout.payment && checkout.reservation) {
           refreshData({
@@ -471,6 +495,7 @@ export function AppProvider({ children }) {
       window.location.assign(checkout.url)
       return { ok: true }
     } catch (error) {
+      console.error('Error Stripe:', error)
       return { ok: false, message: error.message }
     }
   }

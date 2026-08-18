@@ -38,12 +38,29 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
 const db = getFirestore()
 const app = express()
 const port = Number(process.env.PORT) || 4242
+const normalizeOrigin = (origin = '') => origin.trim().replace(/\/$/, '')
 const allowedOrigins = (process.env.APP_URL || 'http://localhost:5173')
   .split(',')
-  .map((origin) => origin.trim().replace(/\/$/, ''))
+  .map(normalizeOrigin)
   .filter(Boolean)
 
-const getAppUrl = (origin) => allowedOrigins.includes(origin) ? origin : allowedOrigins[0]
+const isLocalDevOrigin = (origin) => {
+  if (process.env.NODE_ENV === 'production' || !origin) return false
+  try {
+    const { hostname } = new URL(origin)
+    return ['localhost', '127.0.0.1', '::1'].includes(hostname)
+  } catch {
+    return false
+  }
+}
+const isAllowedOrigin = (origin) => {
+  const normalizedOrigin = normalizeOrigin(origin)
+  return !normalizedOrigin || allowedOrigins.includes(normalizedOrigin) || isLocalDevOrigin(normalizedOrigin)
+}
+const getAppUrl = (origin) => {
+  const normalizedOrigin = normalizeOrigin(origin)
+  return normalizedOrigin && isAllowedOrigin(normalizedOrigin) ? normalizedOrigin : allowedOrigins[0]
+}
 const asDateOnly = (value) => typeof value === 'string' ? value : value?.toDate?.().toISOString().slice(0, 10)
 const TERMS_VERSION = '2026-08-18'
 
@@ -160,26 +177,40 @@ const getCheckoutData = async ({ salonId, date, serviceIds = [], requireAvailabl
   }
 }
 
-const createCheckoutSession = ({ appUrl, amount, salonName, reservationId, paymentId, user, attemptId = 'initial' }) => stripe.checkout.sessions.create({
-  mode: 'payment',
-  customer_email: user.email,
-  client_reference_id: reservationId,
-  expires_at: Math.floor(Date.now() / 1000) + (31 * 60),
-  line_items: [{
-    quantity: 1,
-    price_data: {
-      currency: 'mxn',
-      unit_amount: Math.round(amount * 100),
-      product_data: { name: `Reservación: ${salonName}` },
-    },
-  }],
-  metadata: { reservationId, paymentId, firebaseUid: user.uid },
-  payment_intent_data: {
+const createCheckoutSession = ({ appUrl, amount, salonName, reservationId, paymentId, user, attemptId = 'initial' }) => {
+  const amountInCents = Math.round(Number(amount) * 100)
+  if (!Number.isFinite(amountInCents) || amountInCents <= 0) {
+    throw Object.assign(new Error('El importe de la reservación no es válido para Stripe.'), { status: 409 })
+  }
+  console.log('Creando Stripe Checkout Session:', {
+    reservationId,
+    paymentId,
+    amount,
+    amountInCents,
+    currency: 'mxn',
+  })
+
+  return stripe.checkout.sessions.create({
+    mode: 'payment',
+    customer_email: user.email,
+    client_reference_id: reservationId,
+    expires_at: Math.floor(Date.now() / 1000) + (31 * 60),
+    line_items: [{
+      quantity: 1,
+      price_data: {
+        currency: 'mxn',
+        unit_amount: amountInCents,
+        product_data: { name: `Reservación: ${salonName}` },
+      },
+    }],
     metadata: { reservationId, paymentId, firebaseUid: user.uid },
-  },
-  success_url: `${appUrl}/cliente/reservaciones/${reservationId}?payment=success&session_id={CHECKOUT_SESSION_ID}`,
-  cancel_url: `${appUrl}/cliente/reservaciones/${reservationId}?payment=cancelled`,
-}, { idempotencyKey: `checkout-${paymentId}-${attemptId}` })
+    payment_intent_data: {
+      metadata: { reservationId, paymentId, firebaseUid: user.uid },
+    },
+    success_url: `${appUrl}/cliente/reservaciones/${reservationId}?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${appUrl}/cliente/reservaciones/${reservationId}?payment=cancelled`,
+  }, { idempotencyKey: `checkout-${paymentId}-${attemptId}` })
+}
 
 const refundInvalidCheckout = async (session, paymentReference, reservationReference, updateLedger) => {
   const paymentIntentId = typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id
@@ -420,8 +451,8 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
 
 app.use(cors({
   origin(origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) return callback(null, true)
-    return callback(new Error('Origen no permitido por CORS.'))
+    if (isAllowedOrigin(origin)) return callback(null, true)
+    return callback(new Error(`Origen no permitido por CORS: ${origin}`))
   },
 }))
 app.use(express.json())
@@ -451,8 +482,8 @@ app.post('/stripe/checkout-session', authenticate, async (request, response) => 
       const paymentDocument = await getPaymentForReservation(reservationId)
       if (!paymentDocument) return response.status(404).json({ error: 'No se encontró el registro de pago.' })
       paymentReference = paymentDocument.ref
+      const payment = paymentDocument.data()
       if (reservation.estadoPago === 'pagado') {
-        const payment = paymentDocument.data()
         return response.json({
           status: 'paid',
           reservationId,
@@ -470,8 +501,8 @@ app.post('/stripe/checkout-session', authenticate, async (request, response) => 
           },
         })
       }
-      if (paymentDocument.data().estadoPago !== 'pendiente') {
-        return response.status(409).json({ error: `El pago está ${paymentDocument.data().estadoPago} y no admite un nuevo cobro.` })
+      if (payment.estadoPago !== 'pendiente') {
+        return response.status(409).json({ error: `El pago está ${payment.estadoPago} y no admite un nuevo cobro.` })
       }
       if (reservation.estadoReservacion === 'cancelada') {
         return response.status(409).json({ error: 'La reservación está cancelada y ya no puede pagarse.' })
@@ -480,7 +511,8 @@ app.post('/stripe/checkout-session', authenticate, async (request, response) => 
         return response.status(409).json({ error: 'Esta reservación anterior no tiene un cobro seguro asociado. Crea una nueva reservación.' })
       }
 
-      const previousSessionId = paymentDocument.data().identificadorSesionStripe
+      const previousIdentifier = String(payment.identificadorPagoStripe || '')
+      const previousSessionId = payment.identificadorSesionStripe || (previousIdentifier.startsWith('cs_') ? previousIdentifier : '')
       if (previousSessionId) {
         const previousSession = await stripe.checkout.sessions.retrieve(previousSessionId)
         if (previousSession.payment_status === 'paid') {
@@ -504,7 +536,7 @@ app.post('/stripe/checkout-session', authenticate, async (request, response) => 
       if (!availabilityDocument || availabilityDocument.data().reservacionId !== reservationReference.id) {
         return response.status(409).json({ error: 'La reservación no conserva el bloqueo de esta fecha.' })
       }
-      amount = Number(paymentDocument.data().monto)
+      amount = Number(payment.monto)
       if (!Number.isFinite(amount) || amount <= 0 || amount !== Number(reservation.total)) {
         return response.status(409).json({ error: 'El importe guardado para la reservación no es válido.' })
       }
@@ -542,8 +574,12 @@ app.post('/stripe/checkout-session', authenticate, async (request, response) => 
           throw Object.assign(new Error('La reservación no conserva el bloqueo de esta fecha.'), { status: 409 })
         }
         transaction.update(paymentReference, {
+          identificadorPagoStripe: session.id,
           identificadorSesionStripe: session.id,
           creandoSesionStripe: null,
+        })
+        transaction.update(reservationReference, {
+          identificadorPagoStripe: session.id,
         })
         transaction.update(availabilityDocument.ref, { identificadorSesionStripe: session.id })
       })
@@ -578,9 +614,9 @@ app.post('/stripe/checkout-session', authenticate, async (request, response) => 
           estadoReservacion: 'pendiente',
           fecha: date,
           fechaCreacion: Timestamp.now(),
-          identificadorChat: null,
-          identificadorPagoStripe: null,
-          identificadorSalaVideo: null,
+          identificadorChat: 'pendiente',
+          identificadorPagoStripe: session.id,
+          identificadorSalaVideo: 'pendiente',
           precioSalon: checkout.priceSalon,
           salonesIds: [checkout.salon.id],
           serviciosIds: checkout.services.map((service) => service.id),
@@ -593,18 +629,24 @@ app.post('/stripe/checkout-session', authenticate, async (request, response) => 
           estadoPago: 'pendiente',
           fechaCreacion: Timestamp.now(),
           fechaPago: null,
-          identificadorPagoStripe: null,
+          identificadorPagoStripe: session.id,
           identificadorSesionStripe: session.id,
-          metodoPago: 'Stripe Checkout',
+          metodoPago: 'stripe',
           monto: amount,
           reservacionId: reservationReference.id,
           salonesIds: [checkout.salon.id],
-          tipoPago: 'total',
+          tipoPago: 'apartado',
         })
       })
     }
 
-    return response.status(201).json({ status: 'open', reservationId: reservationReference.id, url: session.url })
+    return response.status(201).json({
+      status: 'open',
+      reservationId: reservationReference.id,
+      paymentId: paymentReference.id,
+      sessionId: session.id,
+      url: session.url,
+    })
   } catch (error) {
     console.error('No se pudo crear Stripe Checkout:', error)
     return response.status(error.status || 500).json({ error: error.message || 'No se pudo iniciar el pago.' })

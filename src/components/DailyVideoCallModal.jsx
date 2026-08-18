@@ -37,7 +37,8 @@ export function DailyVideoCallModal({ reservation, currentUser, onClose, onCallS
     currentUser.rol === 'administrador'
   )
 
-  const roomName = reservation.identificadorSalaVideo || `video-res-${reservation.id}`
+  const storedRoomName = reservation.identificadorSalaVideo
+  const roomName = storedRoomName && storedRoomName !== 'pendiente' ? storedRoomName : `video-res-${reservation.id}`
 
   useEffect(() => {
     if (!isParticipant) {
@@ -131,7 +132,7 @@ export function DailyVideoCallModal({ reservation, currentUser, onClose, onCallS
         dailyCall.destroy().catch((err) => console.error('Error al destruir DailyCall:', err))
       }
     }
-  }, [reservation.id, currentUser?.id])
+  }, [reservation.id, roomName, currentUser?.id])
 
   const toggleAudio = () => {
     if (!callObject) return
